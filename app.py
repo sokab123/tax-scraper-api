@@ -9,6 +9,8 @@ app = Flask(__name__)
 # API Key for security
 API_KEY = os.environ.get('API_KEY', 'TKBnAWSH3cM2OJPlsky8t6UrNpGIY/bV15zc1OibaYQ=')
 
+print(f"API_KEY loaded: {API_KEY[:20]}..." if API_KEY else "API_KEY not set!")
+
 COUNTY_MAP = {
     'palm_beach': 'Palm Beach',
     'miami_dade': 'Miami-Dade',
@@ -159,7 +161,11 @@ def health():
 def scrape():
     # Check API key
     api_key = request.headers.get('X-API-Key')
-    if api_key != API_KEY:
+    
+    print(f"Received API key: {api_key[:20] if api_key else 'None'}...")
+    print(f"Expected API key: {API_KEY[:20]}...")
+    
+    if not api_key or api_key.strip() != API_KEY.strip():
         return jsonify({'error': 'Unauthorized', 'detail': 'Invalid API key'}), 401
     
     data = request.json
