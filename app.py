@@ -6,11 +6,6 @@ import os
 
 app = Flask(__name__)
 
-# API Key for security
-API_KEY = "TKBnAWSH3cM2OJPlsky8t6UrNpGIY/bV15zc1OibaYQ="
-
-print(f"API_KEY loaded: {API_KEY[:20]}..." if API_KEY else "API_KEY not set!")
-
 COUNTY_MAP = {
     'palm_beach': 'Palm Beach',
     'miami_dade': 'Miami-Dade',
@@ -159,14 +154,7 @@ def health():
 
 @app.route('/scrape', methods=['POST'])
 def scrape():
-    # Check API key
-    api_key = request.headers.get('X-API-Key')
-    
-    print(f"Received API key: {api_key[:20] if api_key else 'None'}...")
-    print(f"Expected API key: {API_KEY[:20]}...")
-    
-    if not api_key or api_key.strip() != API_KEY.strip():
-        return jsonify({'error': 'Unauthorized', 'detail': 'Invalid API key'}), 401
+    # TEMPORARILY REMOVED API KEY CHECK FOR TESTING
     
     data = request.json
     url = data.get('url')
@@ -191,9 +179,11 @@ def scrape():
             'properties': listings
         })
     except Exception as e:
+        import traceback
         return jsonify({
             'success': False,
-            'error': str(e)
+            'error': str(e),
+            'traceback': traceback.format_exc()
         }), 500
 
 if __name__ == '__main__':
