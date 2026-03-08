@@ -7,7 +7,7 @@ import os
 app = Flask(__name__)
 
 # API Key for security
-API_KEY = os.environ.get('API_KEY', 'TKBnAWSH3cM2OJPlsky8t6UrNpGIY/bV15zc1OibaYQ=')
+API_KEY = "TKBnAWSH3cM2OJPlsky8t6UrNpGIY/bV15zc1OibaYQ="
 
 print(f"API_KEY loaded: {API_KEY[:20]}..." if API_KEY else "API_KEY not set!")
 
