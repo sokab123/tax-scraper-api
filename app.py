@@ -13,6 +13,32 @@ COUNTY_MAP = {
     'hillsborough': 'Hillsborough'
 }
 
+def normalize_case_number(case_number, county_key):
+    """
+    Normalize case number to short format for all counties
+    
+    Examples:
+    - Palm Beach: 2025-2212TD → 2212TD
+    - Miami-Dade: 2025A00443 → A00443
+    - Duval: 2024-1429TD → 1429TD
+    - Hillsborough: 2026-265 → 265
+    """
+    if county_key in ['palm_beach', 'duval', 'hillsborough']:
+        # These counties use YYYY-XXXXXX format → extract part after dash
+        if '-' in case_number:
+            return case_number.split('-')[-1]
+        return case_number
+    
+    elif county_key == 'miami_dade':
+        # Miami-Dade: 2025A00443 → A00443 (last 6 chars)
+        if len(case_number) > 6:
+            return case_number[-6:]
+        return case_number
+    
+    else:
+        # Unknown county: keep full format
+        return case_number
+
 def scrape_auction(url, county_key):
     """Scrape auction data using Playwright"""
     
@@ -97,7 +123,9 @@ def parse_auction_entry(text, auction_date, county_key):
     if not case_match:
         return None
     
-    case_number = case_match.group(1)
+    raw_case_number = case_match.group(1)
+    # Normalize based on county rules (e.g., 2025-2212TD → 2212TD)
+    case_number = normalize_case_number(raw_case_number, county_key)
     
     # Try to find property address
     # Pattern 1: Multi-line with city/state/zip on next line
