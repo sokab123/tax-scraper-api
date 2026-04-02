@@ -3,9 +3,13 @@ from playwright.sync_api import sync_playwright
 import re
 import time
 import os
+import threading
 from datetime import datetime, timedelta
 
 app = Flask(__name__)
+
+# In-memory job store: job_id -> {status, properties, dates_scraped, total, error}
+scrape_jobs = {}
 
 COUNTY_MAP = {
     'palm_beach': 'Palm Beach',
@@ -344,11 +348,33 @@ def scrape():
         }), 500
 
 
+def run_scrape_job(job_id, county, days_ahead):
+    """Background thread: scrapes and stores results in scrape_jobs."""
+    try:
+        scrape_jobs[job_id]['status'] = 'running'
+        listings, dates_scraped = scrape_auction_multi(county, days_ahead)
+        scrape_jobs[job_id].update({
+            'status': 'done',
+            'properties': listings,
+            'dates_scraped': dates_scraped,
+            'total': len(listings),
+            'error': None
+        })
+    except Exception as e:
+        import traceback
+        scrape_jobs[job_id].update({
+            'status': 'error',
+            'error': str(e),
+            'traceback': traceback.format_exc()
+        })
+
+
 @app.route('/scrape-multi', methods=['POST'])
 def scrape_multi():
     """
-    Scrape all upcoming auction dates for a county up to 120 days out.
-    Automatically follows Next Auction links — no date needed.
+    Start async scrape job for all upcoming auction dates up to days_ahead days out.
+    Returns job_id immediately; use /scrape-multi/status/<job_id> to poll,
+    and /scrape-multi/results/<job_id> to fetch properties when done.
     """
     data = request.json
     county = data.get('county', '').lower()
@@ -360,23 +386,64 @@ def scrape_multi():
             'valid_counties': list(COUNTY_MAP.keys())
         }), 400
 
-    try:
-        listings, dates_scraped = scrape_auction_multi(county, days_ahead)
-        return jsonify({
-            'success': True,
-            'county': county,
-            'county_display': COUNTY_MAP.get(county, county),
-            'count': len(listings),
-            'dates_scraped': dates_scraped,
-            'properties': listings
-        })
-    except Exception as e:
-        import traceback
-        return jsonify({
-            'success': False,
-            'error': str(e),
-            'traceback': traceback.format_exc()
-        }), 500
+    job_id = f"{county}_{int(time.time())}"
+    scrape_jobs[job_id] = {
+        'status': 'started',
+        'county': county,
+        'properties': [],
+        'dates_scraped': [],
+        'total': 0,
+        'error': None
+    }
+
+    t = threading.Thread(target=run_scrape_job, args=(job_id, county, days_ahead), daemon=True)
+    t.start()
+
+    return jsonify({
+        'success': True,
+        'job_id': job_id,
+        'status': 'started',
+        'message': f'Scraping all {COUNTY_MAP[county]} auctions for next {days_ahead} days. Poll /scrape-multi/status/{job_id} for progress.'
+    })
+
+
+@app.route('/scrape-multi/status/<job_id>', methods=['GET'])
+def scrape_multi_status(job_id):
+    """Poll job status. When status=done, call /results/<job_id> to get properties."""
+    if job_id not in scrape_jobs:
+        return jsonify({'error': 'Job not found'}), 404
+
+    job = scrape_jobs[job_id]
+    return jsonify({
+        'job_id': job_id,
+        'status': job['status'],
+        'total': job['total'],
+        'dates_scraped': job['dates_scraped'],
+        'imported': 0,  # import happens on Vercel side
+        'error': job.get('error')
+    })
+
+
+@app.route('/scrape-multi/results/<job_id>', methods=['GET'])
+def scrape_multi_results(job_id):
+    """Fetch actual scraped properties once job is done."""
+    if job_id not in scrape_jobs:
+        return jsonify({'error': 'Job not found'}), 404
+
+    job = scrape_jobs[job_id]
+    if job['status'] not in ('done', 'error'):
+        return jsonify({'error': 'Job not done yet', 'status': job['status']}), 202
+
+    return jsonify({
+        'job_id': job_id,
+        'status': job['status'],
+        'success': job['status'] == 'done',
+        'county': job['county'],
+        'count': job['total'],
+        'dates_scraped': job['dates_scraped'],
+        'properties': job['properties'],
+        'error': job.get('error')
+    })
 
 
 if __name__ == '__main__':
