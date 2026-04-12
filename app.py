@@ -52,6 +52,22 @@ def normalize_case_number(case_number, county_key):
         return case_number
 
 
+def extract_auction_date(url):
+    """Return auction date from a URL, if present."""
+    if not url:
+        return None
+
+    match = re.search(r'(?:AUCTIONDATE|AuctionDate)=(\d{2}/\d{2}/\d{4})', url, re.IGNORECASE)
+    if not match:
+        return None
+
+    try:
+        return datetime.strptime(match.group(1), '%m/%d/%Y')
+    except ValueError:
+        return None
+
+
+
 def get_next_auction_url(page, base_url):
     """Extract the Next Auction URL from the current page."""
     try:
@@ -230,7 +246,7 @@ def scrape_auction_multi(county_key, days_ahead=120):
                     all_listings.extend(listings)
                     dates_scraped.append(auction_date_str)
 
-                # Get next auction URL
+                # Get next auction URL, but never walk backwards into historical auctions.
                 next_url = None
                 try:
                     next_link = page.query_selector('a:has-text("Next Auction")')
@@ -238,7 +254,14 @@ def scrape_auction_multi(county_key, days_ahead=120):
                         href = next_link.get_attribute('href')
                         if href:
                             domain = re.match(r'(https?://[^/]+)', current_url).group(1)
-                            next_url = domain + href
+                            candidate_url = domain + href
+                            candidate_date = extract_auction_date(candidate_url)
+
+                            # Hillsborough can return a past "Next Auction" link when the
+                            # requested date has no upcoming sale, which makes the job crawl
+                            # through old weeks until max_iterations is hit.
+                            if candidate_date and candidate_date >= auction_date and candidate_date >= datetime.today():
+                                next_url = candidate_url
                 except:
                     pass
 
