@@ -25,6 +25,8 @@ COUNTY_BASE_URLS = {
     'hillsborough': 'https://hillsborough.realtaxdeed.com/index.cfm?zaction=AUCTION&Zmethod=PREVIEW&AUCTIONDATE=',
 }
 
+MIAMI_DADE_TAX_LIEN_WEEKDAY = 3  # Thursday
+
 def normalize_case_number(case_number, county_key):
     """
     Normalize case number to correct format per county.
@@ -83,6 +85,30 @@ def get_next_auction_url(page, base_url):
     except:
         pass
     return None
+
+
+def is_supported_auction_date(county_key, auction_date):
+    """Return True when this auction date should be scraped for the county."""
+    if auction_date is None:
+        return False
+
+    if county_key == 'miami_dade':
+        # Miami-Dade tax lien sales are on Thursdays. Other calendar dates can be
+        # mortgage/bank foreclosure auctions that we do not want in the CRM.
+        return auction_date.weekday() == MIAMI_DADE_TAX_LIEN_WEEKDAY
+
+    return True
+
+
+def get_initial_scrape_date(county_key):
+    """Return the first date the multi-scraper should hit for a county."""
+    today = datetime.today()
+
+    if county_key == 'miami_dade':
+        days_until_thursday = (MIAMI_DADE_TAX_LIEN_WEEKDAY - today.weekday()) % 7
+        return today + timedelta(days=days_until_thursday)
+
+    return today
 
 
 def scrape_auction(url, county_key, page=None, browser=None):
@@ -162,10 +188,11 @@ def scrape_auction_multi(county_key, days_ahead=120):
     if county_key not in COUNTY_BASE_URLS:
         raise ValueError(f"Invalid county: {county_key}")
 
-    cutoff_date = datetime.today() + timedelta(days=days_ahead)
+    today = datetime.today()
+    cutoff_date = today + timedelta(days=days_ahead)
     base_url = COUNTY_BASE_URLS[county_key]
-    today_str = datetime.today().strftime('%m/%d/%Y')
-    current_url = base_url + today_str
+    start_date = get_initial_scrape_date(county_key)
+    current_url = base_url + start_date.strftime('%m/%d/%Y')
 
     all_listings = []
     seen_dates = set()
@@ -201,6 +228,8 @@ def scrape_auction_multi(county_key, days_ahead=120):
                 if auction_date_str in seen_dates:
                     break
                 seen_dates.add(auction_date_str)
+
+                should_scrape_date = is_supported_auction_date(county_key, auction_date)
 
                 # Scrape this date
                 context = browser.new_context(
@@ -242,28 +271,38 @@ def scrape_auction_multi(county_key, days_ahead=120):
                     except:
                         break
 
-                if listings:
+                if should_scrape_date and listings:
                     all_listings.extend(listings)
                     dates_scraped.append(auction_date_str)
 
-                # Get next auction URL, but never walk backwards into historical auctions.
+                # Decide the next auction date to scrape.
                 next_url = None
-                try:
-                    next_link = page.query_selector('a:has-text("Next Auction")')
-                    if next_link:
-                        href = next_link.get_attribute('href')
-                        if href:
-                            domain = re.match(r'(https?://[^/]+)', current_url).group(1)
-                            candidate_url = domain + href
-                            candidate_date = extract_auction_date(candidate_url)
+                if county_key == 'miami_dade':
+                    next_candidate_date = auction_date + timedelta(days=7)
+                    if next_candidate_date <= cutoff_date:
+                        next_url = base_url + next_candidate_date.strftime('%m/%d/%Y')
+                else:
+                    try:
+                        next_link = page.query_selector('a:has-text("Next Auction")')
+                        if next_link:
+                            href = next_link.get_attribute('href')
+                            if href:
+                                domain = re.match(r'(https?://[^/]+)', current_url).group(1)
+                                candidate_url = domain + href
+                                candidate_date = extract_auction_date(candidate_url)
 
-                            # Hillsborough can return a past "Next Auction" link when the
-                            # requested date has no upcoming sale, which makes the job crawl
-                            # through old weeks until max_iterations is hit.
-                            if candidate_date and candidate_date >= auction_date and candidate_date >= datetime.today():
-                                next_url = candidate_url
-                except:
-                    pass
+                                # Hillsborough can return a past "Next Auction" link when the
+                                # requested date has no upcoming sale, which makes the job crawl
+                                # through old weeks until max_iterations is hit.
+                                if (
+                                    candidate_date
+                                    and candidate_date >= auction_date
+                                    and candidate_date >= today
+                                    and is_supported_auction_date(county_key, candidate_date)
+                                ):
+                                    next_url = candidate_url
+                    except:
+                        pass
 
                 context.close()
                 current_url = next_url
