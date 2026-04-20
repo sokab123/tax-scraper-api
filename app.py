@@ -111,6 +111,38 @@ def get_initial_scrape_date(county_key):
     return today
 
 
+def find_first_upcoming_hillsborough_auction_url(browser, base_url, today, cutoff_date):
+    """Find the first real upcoming Hillsborough auction date from the calendar page."""
+    context = browser.new_context(
+        user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    )
+
+    try:
+        page = context.new_page()
+        calendar_url = base_url + today.strftime('%m/%d/%Y')
+        page.goto(calendar_url, wait_until='networkidle')
+        time.sleep(4)
+
+        html = page.content()
+        candidate_dates = []
+        for date_str in set(re.findall(r'(?:AuctionDate|AUCTIONDATE)=(\d{2}/\d{2}/\d{4})', html, re.IGNORECASE)):
+            try:
+                candidate_date = datetime.strptime(date_str, '%m/%d/%Y')
+            except ValueError:
+                continue
+
+            if today <= candidate_date <= cutoff_date:
+                candidate_dates.append(candidate_date)
+
+        if not candidate_dates:
+            return None
+
+        first_date = min(candidate_dates)
+        return base_url + first_date.strftime('%m/%d/%Y')
+    finally:
+        context.close()
+
+
 def scrape_auction(url, county_key, page=None, browser=None):
     """Scrape a single auction date. Reuses existing page/browser if provided."""
 
@@ -202,6 +234,9 @@ def scrape_auction_multi(county_key, days_ahead=120):
         browser = p.chromium.launch(headless=True)
 
         try:
+            if county_key == 'hillsborough':
+                current_url = find_first_upcoming_hillsborough_auction_url(browser, base_url, today, cutoff_date)
+
             max_iterations = 30  # Safety cap
             iteration = 0
 
