@@ -70,21 +70,26 @@ def extract_auction_date(url):
 
 
 
-def get_next_auction_url(page, base_url):
-    """Extract the Next Auction URL from the current page."""
+def get_navigation_auction_url(page, base_url, link_text):
+    """Extract a navigation URL like Current or Next Auction from the current page."""
     try:
-        # Look for "Next Auction >>" link
-        next_link = page.query_selector('a:has-text("Next Auction")')
-        if next_link:
-            href = next_link.get_attribute('href')
+        link = page.query_selector(f'a:has-text("{link_text}")')
+        if link:
+            href = link.get_attribute('href')
             if href:
-                # href is relative like /index.cfm?zaction=AUCTION&zmethod=PREVIEW&AuctionDate=04/16/2026
                 domain = re.match(r'(https?://[^/]+)', base_url).group(1)
-                full_url = domain + href
-                return full_url
+                return domain + href
     except:
         pass
     return None
+
+
+def get_next_auction_url(page, base_url):
+    return get_navigation_auction_url(page, base_url, 'Next Auction')
+
+
+def get_current_auction_url(page, base_url):
+    return get_navigation_auction_url(page, base_url, 'Current')
 
 
 def is_supported_auction_date(county_key, auction_date):
@@ -318,24 +323,29 @@ def scrape_auction_multi(county_key, days_ahead=120):
                         next_url = base_url + next_candidate_date.strftime('%m/%d/%Y')
                 else:
                     try:
-                        next_link = page.query_selector('a:has-text("Next Auction")')
-                        if next_link:
-                            href = next_link.get_attribute('href')
-                            if href:
-                                domain = re.match(r'(https?://[^/]+)', current_url).group(1)
-                                candidate_url = domain + href
-                                candidate_date = extract_auction_date(candidate_url)
+                        # Palm Beach can land on a calendar page for a non-sale date where
+                        # "Next Auction" points backward, but "Current" points to the next
+                        # real upcoming auction. Prefer Current when we did not get listings.
+                        fallback_candidates = []
+                        if not listings:
+                            current_candidate_url = get_current_auction_url(page, current_url)
+                            if current_candidate_url:
+                                fallback_candidates.append(current_candidate_url)
 
-                                # Hillsborough can return a past "Next Auction" link when the
-                                # requested date has no upcoming sale, which makes the job crawl
-                                # through old weeks until max_iterations is hit.
-                                if (
-                                    candidate_date
-                                    and candidate_date >= auction_date
-                                    and candidate_date >= today
-                                    and is_supported_auction_date(county_key, candidate_date)
-                                ):
-                                    next_url = candidate_url
+                        next_candidate_url = get_next_auction_url(page, current_url)
+                        if next_candidate_url:
+                            fallback_candidates.append(next_candidate_url)
+
+                        for candidate_url in fallback_candidates:
+                            candidate_date = extract_auction_date(candidate_url)
+                            if (
+                                candidate_date
+                                and candidate_date >= auction_date
+                                and candidate_date >= today
+                                and is_supported_auction_date(county_key, candidate_date)
+                            ):
+                                next_url = candidate_url
+                                break
                     except:
                         pass
 
