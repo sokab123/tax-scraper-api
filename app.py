@@ -551,9 +551,240 @@ def scrape_multi_results(job_id):
         'properties': job['properties'],
         'error': job.get('error')
     })
+# ---- Daily automation: scrape all counties and import directly to Neon ----
+daily_scrape_jobs = {}
 
+def is_cron_authorized(req):
+    expected = os.environ.get('CRON_SECRET') or os.environ.get('SCRAPER_API_KEY')
+    if not expected:
+        return False
+    auth = req.headers.get('Authorization', '')
+    api_key = req.headers.get('X-API-Key', '')
+    return auth == f'Bearer {expected}' or api_key == expected
+
+
+def get_db_connection():
+    database_url = os.environ.get('DATABASE_URL')
+    if not database_url:
+        raise RuntimeError('DATABASE_URL is not configured')
+
+    import psycopg2
+    return psycopg2.connect(database_url, sslmode='require')
+
+
+def normalize_import_case_number(case_number, county_key):
+    value = (case_number or '').strip().upper()
+    if county_key in ['palm_beach', 'duval']:
+        return value.split('-')[-1] if '-' in value else value
+    if county_key == 'miami_dade':
+        return value[-6:] if len(value) > 6 else value
+    return value
+
+
+def initialize_import_tables(conn):
+    with conn.cursor() as cur:
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS seen_properties (
+              id SERIAL PRIMARY KEY,
+              county VARCHAR(255) NOT NULL,
+              case_number VARCHAR(255) NOT NULL,
+              first_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+              last_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+              last_exported_at TIMESTAMP DEFAULT NULL,
+              export_count INTEGER DEFAULT 0,
+              notes TEXT DEFAULT '',
+              CONSTRAINT seen_properties_county_check CHECK (county IN ('palm_beach', 'miami_dade', 'duval', 'hillsborough')),
+              CONSTRAINT seen_properties_unique UNIQUE (county, case_number)
+            )
+        ''')
+        cur.execute('''
+            CREATE UNIQUE INDEX IF NOT EXISTS properties_active_unique
+            ON properties (county, case_number)
+            WHERE deleted_at IS NULL
+        ''')
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS scrape_logs (
+              id SERIAL PRIMARY KEY,
+              county VARCHAR(255) NOT NULL,
+              properties_found INTEGER DEFAULT 0,
+              status VARCHAR(50) NOT NULL,
+              timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+    conn.commit()
+
+
+def mark_import_property_seen(conn, county_key, case_number):
+    normalized = normalize_import_case_number(case_number, county_key)
+    with conn.cursor() as cur:
+        cur.execute('''
+            INSERT INTO seen_properties (county, case_number, first_seen_at, last_seen_at)
+            VALUES (%s, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            ON CONFLICT (county, case_number)
+            DO UPDATE SET last_seen_at = CURRENT_TIMESTAMP
+        ''', (county_key, normalized))
+
+
+def import_scraped_properties(county_key, properties):
+    conn = get_db_connection()
+    imported = 0
+    already_present = 0
+    errors = 0
+
+    try:
+        initialize_import_tables(conn)
+        with conn.cursor() as cur:
+            for property_data in properties:
+                try:
+                    case_number = normalize_import_case_number(property_data.get('case_number'), county_key)
+                    if not case_number:
+                        errors += 1
+                        continue
+
+                    cur.execute(
+                        'SELECT id FROM seen_properties WHERE county = %s AND case_number = %s',
+                        (county_key, case_number)
+                    )
+                    if cur.fetchone():
+                        mark_import_property_seen(conn, county_key, case_number)
+                        already_present += 1
+                        continue
+
+                    cur.execute('''
+                        SELECT id FROM properties
+                        WHERE county = %s
+                          AND deleted_at IS NULL
+                          AND (
+                            case_number = %s
+                            OR REPLACE(case_number, '-', '') = REPLACE(%s, '-', '')
+                          )
+                    ''', (county_key, case_number, case_number))
+                    if cur.fetchone():
+                        mark_import_property_seen(conn, county_key, case_number)
+                        already_present += 1
+                        continue
+
+                    cur.execute('''
+                        INSERT INTO properties (case_number, address, city, state, zip, auction_date, county, stage, notes)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, 'new_leads', %s)
+                    ''', (
+                        case_number,
+                        property_data.get('address') or '',
+                        property_data.get('city') or 'Unknown',
+                        property_data.get('state') or 'FL',
+                        property_data.get('zip') or '00000',
+                        property_data.get('auction_date'),
+                        county_key,
+                        f'Auto-imported from {county_key} daily automation'
+                    ))
+                    mark_import_property_seen(conn, county_key, case_number)
+                    imported += 1
+                except Exception as exc:
+                    print(f'Error importing {county_key} property {property_data.get("case_number")}: {exc}', flush=True)
+                    errors += 1
+
+            cur.execute(
+                'INSERT INTO scrape_logs (county, properties_found, status) VALUES (%s, %s, %s)',
+                (county_key, imported, 'success' if errors == 0 else 'failure')
+            )
+
+        conn.commit()
+        return {
+            'success': True,
+            'county': county_key,
+            'imported': imported,
+            'already_present': already_present,
+            'errors': errors,
+            'total': len(properties)
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def run_daily_scrape_job(job_id, days_ahead):
+    daily_scrape_jobs[job_id]['status'] = 'running'
+    total_imported = 0
+    results = []
+
+    for county_key in COUNTY_MAP.keys():
+        county_result = {
+            'county': county_key,
+            'status': 'running',
+            'imported': 0,
+            'already_present': 0,
+            'errors': 0,
+            'total': 0,
+            'dates_scraped': [],
+            'error': None
+        }
+        daily_scrape_jobs[job_id]['results'][county_key] = county_result
+
+        try:
+            listings, dates_scraped = scrape_auction_multi(county_key, days_ahead)
+            import_result = import_scraped_properties(county_key, listings)
+            county_result.update(import_result)
+            county_result['status'] = 'done'
+            county_result['dates_scraped'] = dates_scraped
+            total_imported += import_result['imported']
+        except Exception as exc:
+            import traceback
+            county_result['status'] = 'error'
+            county_result['error'] = str(exc)
+            county_result['traceback'] = traceback.format_exc()
+
+        results.append(county_result.copy())
+
+    has_errors = any(result['status'] == 'error' or result.get('errors', 0) > 0 for result in results)
+    daily_scrape_jobs[job_id].update({
+        'status': 'error' if has_errors else 'done',
+        'total_imported': total_imported,
+        'results_list': results,
+        'finished_at': datetime.utcnow().isoformat() + 'Z'
+    })
+
+
+@app.route('/cron/daily-scrape', methods=['POST', 'GET'])
+def start_daily_scrape():
+    if not is_cron_authorized(request):
+        return jsonify({'error': 'Unauthorized or missing CRON_SECRET/SCRAPER_API_KEY'}), 401
+
+    data = request.get_json(silent=True) or {}
+    days_ahead = int(data.get('days_ahead', 120))
+    job_id = f"daily_{int(time.time())}"
+
+    daily_scrape_jobs[job_id] = {
+        'job_id': job_id,
+        'status': 'started',
+        'days_ahead': days_ahead,
+        'started_at': datetime.utcnow().isoformat() + 'Z',
+        'finished_at': None,
+        'total_imported': 0,
+        'results': {},
+        'results_list': []
+    }
+
+    thread = threading.Thread(target=run_daily_scrape_job, args=(job_id, days_ahead), daemon=True)
+    thread.start()
+
+    return jsonify({
+        'success': True,
+        'job_id': job_id,
+        'status': 'started',
+        'message': 'Daily four-county scrape started in Railway background worker.'
+    })
+
+
+@app.route('/cron/daily-scrape/status/<job_id>', methods=['GET'])
+def daily_scrape_status(job_id):
+    if not is_cron_authorized(request):
+        return jsonify({'error': 'Unauthorized or missing CRON_SECRET/SCRAPER_API_KEY'}), 401
+    if job_id not in daily_scrape_jobs:
+        return jsonify({'error': 'Job not found'}), 404
+    return jsonify(daily_scrape_jobs[job_id])
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8000))
     app.run(host='0.0.0.0', port=port)
-# cache bust Thu Apr  2 09:54:07 EDT 2026
