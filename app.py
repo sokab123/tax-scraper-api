@@ -641,15 +641,6 @@ def import_scraped_properties(county_key, properties):
                         errors += 1
                         continue
 
-                    cur.execute(
-                        'SELECT id FROM seen_properties WHERE county = %s AND case_number = %s',
-                        (county_key, case_number)
-                    )
-                    if cur.fetchone():
-                        mark_import_property_seen(conn, county_key, case_number)
-                        already_present += 1
-                        continue
-
                     cur.execute('''
                         SELECT id FROM properties
                         WHERE county = %s
@@ -663,6 +654,30 @@ def import_scraped_properties(county_key, properties):
                         mark_import_property_seen(conn, county_key, case_number)
                         already_present += 1
                         continue
+
+                    # Previously exported/deleted records are tracked in seen_properties so the
+                    # same lead is not re-imported forever. Miami-Dade can reuse the same case
+                    # number when a property is rescheduled for a later auction date, though, so
+                    # only suppress a seen case when we've already had that same auction date.
+                    cur.execute('''
+                        SELECT id FROM seen_properties
+                        WHERE county = %s AND case_number = %s
+                    ''', (county_key, case_number))
+                    if cur.fetchone():
+                        cur.execute('''
+                            SELECT id FROM properties
+                            WHERE county = %s
+                              AND (
+                                case_number = %s
+                                OR REPLACE(case_number, '-', '') = REPLACE(%s, '-', '')
+                              )
+                              AND auction_date = %s
+                            LIMIT 1
+                        ''', (county_key, case_number, case_number, property_data.get('auction_date')))
+                        if cur.fetchone():
+                            mark_import_property_seen(conn, county_key, case_number)
+                            already_present += 1
+                            continue
 
                     cur.execute('''
                         INSERT INTO properties (case_number, address, city, state, zip, auction_date, county, stage, notes)
