@@ -1,10 +1,14 @@
 from flask import Flask, request, jsonify
 from playwright.sync_api import sync_playwright
+import http.cookiejar
+import json
 import re
 import time
 import os
 import threading
 from datetime import datetime, timedelta
+from urllib.parse import urlencode
+from urllib.request import HTTPCookieProcessor, Request, build_opener
 
 app = Flask(__name__)
 
@@ -26,6 +30,10 @@ COUNTY_BASE_URLS = {
 }
 
 MIAMI_DADE_TAX_LIEN_WEEKDAY = 3  # Thursday
+PALM_BEACH_CLERK_HOME_URL = 'https://taxdeed.mypalmbeachclerk.com/Home/'
+PALM_BEACH_CLERK_GRID_URL = 'https://taxdeed.mypalmbeachclerk.com/Home/GridSearchData?SearchType=Sale%20Date'
+PALM_BEACH_ACTIVE_STATUSES = {'SALE', 'PENDING SALE'}
+DEFAULT_USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
 
 def normalize_case_number(case_number, county_key):
     """
@@ -148,6 +156,188 @@ def find_first_upcoming_hillsborough_auction_url(browser, base_url, today, cutof
         context.close()
 
 
+def make_http_opener():
+    cookie_jar = http.cookiejar.CookieJar()
+    return build_opener(HTTPCookieProcessor(cookie_jar))
+
+
+def http_get(opener, url):
+    request_obj = Request(url, headers={'User-Agent': DEFAULT_USER_AGENT})
+    with opener.open(request_obj, timeout=60) as response:
+        return response.read().decode('utf-8', errors='replace')
+
+
+def http_post(opener, url, data):
+    request_obj = Request(
+        url,
+        data=urlencode(data).encode('utf-8'),
+        headers={
+            'User-Agent': DEFAULT_USER_AGENT,
+            'Content-Type': 'application/x-www-form-urlencoded'
+        }
+    )
+    with opener.open(request_obj, timeout=60) as response:
+        return response.read().decode('utf-8', errors='replace')
+
+
+def parse_palm_beach_clerk_date(value):
+    try:
+        return datetime.strptime(value, '%A, %B %d, %Y %I:%M %p')
+    except ValueError:
+        return None
+
+
+def collect_palm_beach_clerk_sale_dates(opener, days_ahead):
+    home_html = http_get(opener, PALM_BEACH_CLERK_HOME_URL)
+    today = datetime.today().replace(hour=0, minute=0, second=0, microsecond=0)
+    cutoff = today + timedelta(days=days_ahead)
+    options = re.findall(r"<OPTION\s+value='([^']+)'>[^<]+</OPTION>", home_html, re.IGNORECASE)
+
+    found = {}
+    for value in options:
+        parsed = parse_palm_beach_clerk_date(value)
+        if parsed and today <= parsed <= cutoff:
+            found[value] = parsed
+
+    return [value for value, _ in sorted(found.items(), key=lambda item: item[1])]
+
+
+def same_address(left, right):
+    normalize = lambda value: re.sub(r'[^A-Z0-9]', '', value or '').upper()
+    return bool(left and right and normalize(left) == normalize(right))
+
+
+def get_palm_beach_property_appraiser_data(opener, parcel_id):
+    compact_pcn = re.sub(r'\D', '', parcel_id or '')
+    if not compact_pcn:
+        return {}
+
+    url = f'https://pbcpao.gov/Property/Details?parcelId={compact_pcn}'
+    try:
+        page_html = http_get(opener, url)
+    except Exception as exc:
+        print(f'Could not fetch Palm Beach Property Appraiser page for {parcel_id}: {exc}', flush=True)
+        return {'property_appraiser_url': url}
+
+    model_match = re.search(r'var model = (\{.*?\});', page_html, re.DOTALL)
+    if not model_match:
+        return {'property_appraiser_url': url}
+
+    try:
+        model = json.loads(model_match.group(1))
+    except json.JSONDecodeError:
+        return {'property_appraiser_url': url}
+
+    detail = model.get('propertyDetail') or {}
+    location = (detail.get('Location') or '').strip()
+    mailing_line1 = (detail.get('AddressLine1') or '').strip()
+    mailing_line3 = (detail.get('AddressLine3') or '').strip()
+
+    city = ''
+    zip_code = ''
+    mailing_line3_match = re.search(r'(.+?)\s+FL\s+(\d{5})', mailing_line3)
+    if mailing_line3_match and same_address(location, mailing_line1):
+        city = mailing_line3_match.group(1).strip()
+        zip_code = mailing_line3_match.group(2).strip()
+    elif (detail.get('Municipality') or '').strip().upper() != 'UNINCORPORATED':
+        city = (detail.get('Municipality') or '').strip()
+
+    return {
+        'address': location or mailing_line1,
+        'city': city,
+        'zip': zip_code,
+        'owner_name': (detail.get('OwnerName') or '').strip(),
+        'municipality': (detail.get('Municipality') or '').strip(),
+        'property_appraiser_url': url,
+        'mailing_address_line1': mailing_line1,
+        'mailing_address_line3': mailing_line3,
+        'legal_description': (detail.get('LegalDesc') or '').strip()
+    }
+
+
+def parse_palm_beach_clerk_row(opener, row):
+    cells = row.get('cell') or []
+    if len(cells) < 10:
+        return None
+
+    status = cells[5].strip().upper()
+    if status not in PALM_BEACH_ACTIVE_STATUSES:
+        return None
+
+    raw_case_number = cells[1].strip()
+    parcel_id = cells[3].strip()
+    address_data = get_palm_beach_property_appraiser_data(opener, parcel_id)
+
+    return {
+        'auction_date': datetime.strptime(cells[4].strip(), '%m/%d/%Y').strftime('%m/%d/%Y'),
+        'case_number': raw_case_number,
+        'address': address_data.get('address') or '',
+        'city': address_data.get('city') or 'Unknown',
+        'state': 'FL',
+        'zip': address_data.get('zip') or '00000',
+        'county': 'palm_beach',
+        'parcel_id': parcel_id,
+        'source': 'taxdeed.mypalmbeachclerk.com',
+        'status': status,
+        'opening_bid': cells[6].strip(),
+        'clerk_case_id': row.get('id'),
+        'detail_url': f'https://taxdeed.mypalmbeachclerk.com/Home/Details?id={row.get("id")}',
+        'property_appraiser': address_data
+    }
+
+
+def scrape_palm_beach_clerk_sale_date(opener, sale_date_value):
+    http_post(opener, PALM_BEACH_CLERK_HOME_URL, {
+        'SearchSaleDateFrom': sale_date_value,
+        'SearchSaleDateTo': sale_date_value,
+        'buttonSubmitSaleDate': ''
+    })
+
+    rows = []
+    page = 1
+    total_pages = 1
+    while page <= total_pages:
+        payload = http_get(
+            opener,
+            f"{PALM_BEACH_CLERK_GRID_URL}&{urlencode({'page': page, 'rows': 100, 'sidx': '', 'sord': 'asc'})}"
+        )
+        data = json.loads(payload)
+        total_pages = int(data.get('total') or 1)
+        rows.extend(data.get('rows') or [])
+        page += 1
+
+    listings = []
+    for row in rows:
+        listing = parse_palm_beach_clerk_row(opener, row)
+        if listing:
+            listings.append(listing)
+
+    return listings
+
+
+def scrape_palm_beach_clerk_multi(days_ahead=120):
+    opener = make_http_opener()
+    sale_dates = collect_palm_beach_clerk_sale_dates(opener, days_ahead)
+
+    all_listings = []
+    dates_scraped = []
+    seen_cases = set()
+    for sale_date_value in sale_dates:
+        listings = scrape_palm_beach_clerk_sale_date(opener, sale_date_value)
+        if listings:
+            parsed_date = parse_palm_beach_clerk_date(sale_date_value)
+            dates_scraped.append(parsed_date.strftime('%m/%d/%Y'))
+
+        for listing in listings:
+            case_number = listing.get('case_number')
+            if not case_number or case_number in seen_cases:
+                continue
+            seen_cases.add(case_number)
+            all_listings.append(listing)
+
+    return all_listings, dates_scraped
+
+
 def scrape_auction(url, county_key, page=None, browser=None):
     """Scrape a single auction date. Reuses existing page/browser if provided."""
 
@@ -222,6 +412,9 @@ def scrape_auction_multi(county_key, days_ahead=120):
     Scrape all auction dates for a county up to days_ahead days from today.
     Follows 'Next Auction >>' links automatically.
     """
+    if county_key == 'palm_beach':
+        return scrape_palm_beach_clerk_multi(days_ahead)
+
     if county_key not in COUNTY_BASE_URLS:
         raise ValueError(f"Invalid county: {county_key}")
 
