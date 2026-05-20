@@ -133,7 +133,7 @@ def find_first_upcoming_hillsborough_auction_url(browser, base_url, today, cutof
     try:
         page = context.new_page()
         calendar_url = base_url + today.strftime('%m/%d/%Y')
-        page.goto(calendar_url, wait_until='networkidle')
+        page.goto(calendar_url, wait_until='domcontentloaded', timeout=45000)
         time.sleep(4)
 
         html = page.content()
@@ -355,7 +355,7 @@ def scrape_auction(url, county_key, page=None, browser=None):
             user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         )
         page = context.new_page()
-        page.goto(url, wait_until='networkidle')
+        page.goto(url, wait_until='domcontentloaded', timeout=45000)
         time.sleep(6)
 
         date_match = re.search(r'AUCTIONDATE=(\d{2}/\d{2}/\d{4})', url, re.IGNORECASE)
@@ -469,7 +469,7 @@ def scrape_auction_multi(county_key, days_ahead=120):
                     user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
                 )
                 page = context.new_page()
-                page.goto(current_url, wait_until='networkidle')
+                page.goto(current_url, wait_until='domcontentloaded', timeout=45000)
                 time.sleep(6)
 
                 try:
