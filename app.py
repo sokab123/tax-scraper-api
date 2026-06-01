@@ -883,15 +883,17 @@ def import_scraped_properties(county_key, properties):
                             already_present += 1
                             continue
 
+                    zip_val = property_data.get('zip') or '00000'
                     cur.execute('''
-                        INSERT INTO properties (case_number, address, city, state, zip, auction_date, county, stage, notes)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, 'new_leads', %s)
+                        INSERT INTO properties (case_number, address, city, state, zip, zip_code, auction_date, county, stage, notes)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'new_leads', %s)
                     ''', (
                         case_number,
                         property_data.get('address') or '',
                         property_data.get('city') or 'Unknown',
                         property_data.get('state') or 'FL',
-                        property_data.get('zip') or '00000',
+                        zip_val,
+                        zip_val,
                         property_data.get('auction_date'),
                         county_key,
                         f'Auto-imported from {county_key} daily automation'
