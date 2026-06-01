@@ -233,14 +233,25 @@ def get_palm_beach_property_appraiser_data(opener, parcel_id):
     mailing_line1 = (detail.get('AddressLine1') or '').strip()
     mailing_line3 = (detail.get('AddressLine3') or '').strip()
 
-    city = ''
+    # Municipality is always the property's city (not the owner's mailing city)
+    municipality = (detail.get('Municipality') or '').strip()
+    city = municipality if municipality.upper() not in ('', 'UNINCORPORATED') else ''
+
+    # Zip: extract from AddressLine3 whenever it's a FL address.
+    # We don't require situs == mailing because most tax-foreclosure owners
+    # don't live at the property, so same_address() would almost always fail.
     zip_code = ''
-    mailing_line3_match = re.search(r'(.+?)\s+FL\s+(\d{5})', mailing_line3)
-    if mailing_line3_match and same_address(location, mailing_line1):
-        city = mailing_line3_match.group(1).strip()
-        zip_code = mailing_line3_match.group(2).strip()
-    elif (detail.get('Municipality') or '').strip().upper() != 'UNINCORPORATED':
-        city = (detail.get('Municipality') or '').strip()
+    mailing_line3_match = re.search(r'\bFL\s+(\d{5})', mailing_line3, re.IGNORECASE)
+    if mailing_line3_match:
+        zip_code = mailing_line3_match.group(1).strip()
+
+    # If we still have nothing for city, try the old mailing-line3 parse as a fallback
+    if not city:
+        mailing_city_match = re.search(r'(.+?)\s+FL\s+(\d{5})', mailing_line3, re.IGNORECASE)
+        if mailing_city_match and same_address(location, mailing_line1):
+            city = mailing_city_match.group(1).strip()
+            if not zip_code:
+                zip_code = mailing_city_match.group(2).strip()
 
     return {
         'address': location or mailing_line1,
