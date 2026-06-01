@@ -588,9 +588,9 @@ def parse_auction_entry(text, auction_date, county_key):
         addr_match = re.search(r'Property Address:\s*([^\n]+)', text, re.IGNORECASE)
         if addr_match:
             full_addr = addr_match.group(1).strip()
-            city_zip_match = re.search(r'([A-Za-z\s]+),?\s*FL[- ]?(\d{5})', full_addr, re.IGNORECASE)
+            city_zip_match = re.search(r'([A-Za-z\s]+),?\s*FL[- ]*(\d{5})', full_addr, re.IGNORECASE)
             if city_zip_match:
-                street = re.sub(r'[,]?\s*[A-Za-z\s]+,?\s*FL[- ]?\d{5}.*$', '', full_addr, flags=re.IGNORECASE).strip()
+                street = re.sub(r'[,]?\s*[A-Za-z\s]+,?\s*FL[- ]*\d{5}.*$', '', full_addr, flags=re.IGNORECASE).strip()
                 city = city_zip_match.group(1).strip()
                 zip_code = city_zip_match.group(2)
                 return {
