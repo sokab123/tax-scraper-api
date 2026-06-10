@@ -30,6 +30,7 @@ COUNTY_BASE_URLS = {
 }
 
 MIAMI_DADE_TAX_LIEN_WEEKDAY = 3  # Thursday
+DUVAL_TAX_DEED_WEEKDAY = 2  # Wednesday
 PALM_BEACH_CLERK_HOME_URL = 'https://taxdeed.mypalmbeachclerk.com/Home/'
 PALM_BEACH_CLERK_GRID_URL = 'https://taxdeed.mypalmbeachclerk.com/Home/GridSearchData?SearchType=Sale%20Date'
 PALM_BEACH_ACTIVE_STATUSES = {'SALE', 'PENDING SALE'}
@@ -110,6 +111,9 @@ def is_supported_auction_date(county_key, auction_date):
         # mortgage/bank foreclosure auctions that we do not want in the CRM.
         return auction_date.weekday() == MIAMI_DADE_TAX_LIEN_WEEKDAY
 
+    if county_key == 'duval':
+        return auction_date.weekday() == DUVAL_TAX_DEED_WEEKDAY
+
     return True
 
 
@@ -120,6 +124,10 @@ def get_initial_scrape_date(county_key):
     if county_key == 'miami_dade':
         days_until_thursday = (MIAMI_DADE_TAX_LIEN_WEEKDAY - today.weekday()) % 7
         return today + timedelta(days=days_until_thursday)
+
+    if county_key == 'duval':
+        days_until_wednesday = (DUVAL_TAX_DEED_WEEKDAY - today.weekday()) % 7
+        return today + timedelta(days=days_until_wednesday)
 
     return today
 
@@ -521,7 +529,7 @@ def scrape_auction_multi(county_key, days_ahead=120):
 
                 # Decide the next auction date to scrape.
                 next_url = None
-                if county_key == 'miami_dade':
+                if county_key in ['miami_dade', 'duval']:
                     next_candidate_date = auction_date + timedelta(days=7)
                     if next_candidate_date <= cutoff_date:
                         next_url = base_url + next_candidate_date.strftime('%m/%d/%Y')
@@ -885,14 +893,13 @@ def import_scraped_properties(county_key, properties):
 
                     zip_val = property_data.get('zip') or '00000'
                     cur.execute('''
-                        INSERT INTO properties (case_number, address, city, state, zip, zip_code, auction_date, county, stage, notes)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'new_leads', %s)
+                        INSERT INTO properties (case_number, address, city, state, zip, auction_date, county, stage, notes)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, 'new_leads', %s)
                     ''', (
                         case_number,
                         property_data.get('address') or '',
                         property_data.get('city') or 'Unknown',
                         property_data.get('state') or 'FL',
-                        zip_val,
                         zip_val,
                         property_data.get('auction_date'),
                         county_key,
