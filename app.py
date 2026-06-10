@@ -8,7 +8,7 @@ import os
 import threading
 from datetime import datetime, timedelta
 from urllib.parse import urlencode
-from urllib.request import HTTPCookieProcessor, Request, build_opener
+from urllib.request import HTTPCookieProcessor, Request, build_opener, urlopen
 
 app = Flask(__name__)
 
@@ -35,6 +35,17 @@ PALM_BEACH_CLERK_HOME_URL = 'https://taxdeed.mypalmbeachclerk.com/Home/'
 PALM_BEACH_CLERK_GRID_URL = 'https://taxdeed.mypalmbeachclerk.com/Home/GridSearchData?SearchType=Sale%20Date'
 PALM_BEACH_ACTIVE_STATUSES = {'SALE', 'PENDING SALE'}
 DEFAULT_USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+REQUIRED_PROPERTIES_COLUMNS = {
+    'case_number',
+    'address',
+    'city',
+    'state',
+    'zip',
+    'auction_date',
+    'county',
+    'stage',
+    'notes',
+}
 
 def normalize_case_number(case_number, county_key):
     """
@@ -823,7 +834,26 @@ def initialize_import_tables(conn):
               timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+        cur.execute("ALTER TABLE scrape_logs ADD COLUMN IF NOT EXISTS imported INTEGER DEFAULT 0")
+        cur.execute("ALTER TABLE scrape_logs ADD COLUMN IF NOT EXISTS already_present INTEGER DEFAULT 0")
+        cur.execute("ALTER TABLE scrape_logs ADD COLUMN IF NOT EXISTS errors INTEGER DEFAULT 0")
+        cur.execute("ALTER TABLE scrape_logs ADD COLUMN IF NOT EXISTS dates_scraped TEXT DEFAULT ''")
+        cur.execute("ALTER TABLE scrape_logs ADD COLUMN IF NOT EXISTS warnings TEXT DEFAULT ''")
     conn.commit()
+
+
+def validate_properties_schema(conn):
+    with conn.cursor() as cur:
+        cur.execute('''
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'properties'
+        ''')
+        existing = {row[0] for row in cur.fetchall()}
+
+    missing = sorted(REQUIRED_PROPERTIES_COLUMNS - existing)
+    if missing:
+        raise RuntimeError(f'Neon properties table missing required columns: {", ".join(missing)}')
 
 
 def mark_import_property_seen(conn, county_key, case_number):
@@ -837,14 +867,72 @@ def mark_import_property_seen(conn, county_key, case_number):
         ''', (county_key, normalized))
 
 
-def import_scraped_properties(county_key, properties):
+def build_county_warnings(county_result):
+    warnings = []
+    total = county_result.get('total', 0) or 0
+    imported = county_result.get('imported', 0) or 0
+    already_present = county_result.get('already_present', 0) or 0
+    errors = county_result.get('errors', 0) or 0
+    dates_scraped = county_result.get('dates_scraped') or []
+
+    if county_result.get('status') == 'error':
+        warnings.append(f"{county_result['county']} scrape failed: {county_result.get('error')}")
+
+    if errors:
+        warnings.append(f"{county_result['county']} had {errors} import errors")
+
+    if total and imported == 0 and already_present == 0 and errors == 0:
+        warnings.append(f"{county_result['county']} found {total} source records but imported none")
+
+    if total and not dates_scraped:
+        warnings.append(f"{county_result['county']} found {total} source records but recorded no scraped dates")
+
+    return warnings
+
+
+def send_telegram_alert(subject, warnings, results):
+    bot_token = os.environ.get('TELEGRAM_BOT_TOKEN')
+    chat_id = os.environ.get('TELEGRAM_CHAT_ID')
+    if not bot_token or not chat_id or not warnings:
+        return False
+
+    summary_lines = []
+    for result in results:
+        summary_lines.append(
+            f"{result['county']}: found {result.get('total', 0)}, "
+            f"imported {result.get('imported', 0)}, "
+            f"already {result.get('already_present', 0)}, "
+            f"errors {result.get('errors', 0)}"
+        )
+
+    text_body = subject + "\n\nWarnings:\n- " + "\n- ".join(warnings)
+    if summary_lines:
+        text_body += "\n\nSummary:\n- " + "\n- ".join(summary_lines)
+
+    data = urlencode({
+        'chat_id': chat_id,
+        'text': text_body[:3900],
+        'disable_web_page_preview': 'true',
+    }).encode('utf-8')
+    request_obj = Request(
+        f'https://api.telegram.org/bot{bot_token}/sendMessage',
+        data=data,
+        headers={'Content-Type': 'application/x-www-form-urlencoded'}
+    )
+    with urlopen(request_obj, timeout=15) as response:
+        return 200 <= response.status < 300
+
+
+def import_scraped_properties(county_key, properties, dates_scraped=None):
     conn = get_db_connection()
     imported = 0
     already_present = 0
     errors = 0
+    dates_scraped = dates_scraped or []
 
     try:
         initialize_import_tables(conn)
+        validate_properties_schema(conn)
         with conn.cursor() as cur:
             for property_data in properties:
                 try:
@@ -912,8 +1000,20 @@ def import_scraped_properties(county_key, properties):
                     errors += 1
 
             cur.execute(
-                'INSERT INTO scrape_logs (county, properties_found, status) VALUES (%s, %s, %s)',
-                (county_key, imported, 'success' if errors == 0 else 'failure')
+                '''
+                INSERT INTO scrape_logs
+                  (county, properties_found, imported, already_present, errors, dates_scraped, status)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ''',
+                (
+                    county_key,
+                    len(properties),
+                    imported,
+                    already_present,
+                    errors,
+                    ','.join(dates_scraped),
+                    'success' if errors == 0 else 'failure'
+                )
             )
 
         conn.commit()
@@ -923,7 +1023,8 @@ def import_scraped_properties(county_key, properties):
             'imported': imported,
             'already_present': already_present,
             'errors': errors,
-            'total': len(properties)
+            'total': len(properties),
+            'log_written': True
         }
     except Exception:
         conn.rollback()
@@ -936,6 +1037,7 @@ def run_daily_scrape_job(job_id, days_ahead):
     daily_scrape_jobs[job_id]['status'] = 'running'
     total_imported = 0
     results = []
+    all_warnings = []
 
     for county_key in COUNTY_MAP.keys():
         county_result = {
@@ -946,13 +1048,14 @@ def run_daily_scrape_job(job_id, days_ahead):
             'errors': 0,
             'total': 0,
             'dates_scraped': [],
+            'warnings': [],
             'error': None
         }
         daily_scrape_jobs[job_id]['results'][county_key] = county_result
 
         try:
             listings, dates_scraped = scrape_auction_multi(county_key, days_ahead)
-            import_result = import_scraped_properties(county_key, listings)
+            import_result = import_scraped_properties(county_key, listings, dates_scraped)
             county_result.update(import_result)
             county_result['status'] = 'done'
             county_result['dates_scraped'] = dates_scraped
@@ -963,12 +1066,44 @@ def run_daily_scrape_job(job_id, days_ahead):
             county_result['error'] = str(exc)
             county_result['traceback'] = traceback.format_exc()
 
+        county_result['warnings'] = build_county_warnings(county_result)
+        all_warnings.extend(county_result['warnings'])
+
+        try:
+            with get_db_connection() as conn:
+                initialize_import_tables(conn)
+                with conn.cursor() as cur:
+                    if county_result.get('log_written'):
+                        cur.execute('''
+                            UPDATE scrape_logs
+                            SET warnings = %s
+                            WHERE id = (
+                                SELECT id FROM scrape_logs
+                                WHERE county = %s
+                                ORDER BY timestamp DESC
+                                LIMIT 1
+                            )
+                        ''', ('\n'.join(county_result['warnings']), county_key))
+                conn.commit()
+        except Exception as exc:
+            print(f'Could not update scrape warnings for {county_key}: {exc}', flush=True)
+
         results.append(county_result.copy())
+        daily_scrape_jobs[job_id]['results'][county_key] = county_result
 
     has_errors = any(result['status'] == 'error' or result.get('errors', 0) > 0 for result in results)
+    alert_sent = False
+    if all_warnings:
+        try:
+            alert_sent = send_telegram_alert('Tax CRM scraper warning', all_warnings, results)
+        except Exception as exc:
+            print(f'Could not send Telegram scrape alert: {exc}', flush=True)
+
     daily_scrape_jobs[job_id].update({
         'status': 'error' if has_errors else 'done',
         'total_imported': total_imported,
+        'warnings': all_warnings,
+        'alert_sent': alert_sent,
         'results_list': results,
         'finished_at': datetime.utcnow().isoformat() + 'Z'
     })
