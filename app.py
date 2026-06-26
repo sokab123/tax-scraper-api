@@ -942,7 +942,7 @@ def import_scraped_properties(county_key, properties, dates_scraped=None):
                         continue
 
                     cur.execute('''
-                        SELECT id FROM properties
+                        SELECT id, city, zip FROM properties
                         WHERE county = %s
                           AND deleted_at IS NULL
                           AND (
@@ -950,7 +950,33 @@ def import_scraped_properties(county_key, properties, dates_scraped=None):
                             OR REPLACE(case_number, '-', '') = REPLACE(%s, '-', '')
                           )
                     ''', (county_key, case_number, case_number))
-                    if cur.fetchone():
+                    existing_property = cur.fetchone()
+                    if existing_property:
+                        existing_id, existing_city, existing_zip = existing_property
+                        incoming_city = property_data.get('city')
+                        incoming_zip = property_data.get('zip')
+                        update_fields = []
+                        update_values = []
+
+                        if incoming_city and incoming_city != 'Unknown' and (not existing_city or existing_city == 'Unknown'):
+                            update_fields.append('city = %s')
+                            update_values.append(incoming_city)
+
+                        if incoming_zip and incoming_zip != '00000' and (not existing_zip or existing_zip == '00000'):
+                            update_fields.append('zip = %s')
+                            update_values.append(incoming_zip)
+
+                        if update_fields:
+                            update_values.append(existing_id)
+                            cur.execute(
+                                f'''
+                                UPDATE properties
+                                SET {', '.join(update_fields)}, updated_at = NOW()
+                                WHERE id = %s
+                                ''',
+                                tuple(update_values)
+                            )
+
                         mark_import_property_seen(conn, county_key, case_number)
                         already_present += 1
                         continue
