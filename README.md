@@ -54,6 +54,9 @@ success or partial import. Apply the CRM's `20260910_add_broward.sql` migration
 before importing into an existing database.
 
 Run contract tests with `python3 -m unittest discover -s tests -v`.
-Fixtures are synthetic: live requests from the development machine returned
-HTTP 403 on September 10, 2026. Live source fields and pagination still require
-verification from an environment with access.
+Ten contract/regression tests pass, including the observed Broward no-sale-page
+layout. Live verification on September 10, 2026 collected 27 unique properties
+across three pages for October 26, 2026, using the existing configured browser
+user agent. Sample source fields matched Chromium; both single-date scraping
+and local/hosted upcoming-auction navigation were verified. The CRM imported all 27
+through its existing duplicate/history checks.
