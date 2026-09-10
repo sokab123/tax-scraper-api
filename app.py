@@ -7,7 +7,7 @@ import time
 import os
 import threading
 from datetime import datetime, timedelta
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urljoin, urlparse
 from urllib.request import HTTPCookieProcessor, Request, build_opener, urlopen
 
 app = Flask(__name__)
@@ -19,10 +19,12 @@ COUNTY_MAP = {
     'palm_beach': 'Palm Beach',
     'miami_dade': 'Miami-Dade',
     'duval': 'Duval',
-    'hillsborough': 'Hillsborough'
+    'hillsborough': 'Hillsborough',
+    'broward': 'Broward'
 }
 
 COUNTY_BASE_URLS = {
+    'broward': 'https://broward.realtaxdeed.com/index.cfm?zaction=AUCTION&Zmethod=PREVIEW&AUCTIONDATE=',
     'palm_beach': 'https://palmbeach.realtaxdeed.com/index.cfm?zaction=AUCTION&Zmethod=PREVIEW&AUCTIONDATE=',
     'miami_dade': 'https://miami-dade.realtaxdeed.com/index.cfm?zaction=AUCTION&Zmethod=PREVIEW&AUCTIONDATE=',
     'duval': 'https://duval.realtaxdeed.com/index.cfm?zaction=AUCTION&Zmethod=PREVIEW&AUCTIONDATE=',
@@ -97,8 +99,9 @@ def get_navigation_auction_url(page, base_url, link_text):
         if link:
             href = link.get_attribute('href')
             if href:
-                domain = re.match(r'(https?://[^/]+)', base_url).group(1)
-                return domain + href
+                target = urljoin(base_url, href)
+                if urlparse(target).netloc == urlparse(base_url).netloc:
+                    return target
     except:
         pass
     return None
@@ -368,6 +371,19 @@ def scrape_palm_beach_clerk_multi(days_ahead=120):
     return all_listings, dates_scraped
 
 
+def validate_broward_page(page, response, county_key):
+    """Never report an access-denied or unrecognized Broward page as zero leads."""
+    if county_key != 'broward':
+        return
+    if response is None or response.status >= 400:
+        status = response.status if response else 'no response'
+        raise RuntimeError(f'Broward auction website unavailable (HTTP {status}); no records imported')
+    if not page.query_selector('#Area_W'):
+        text = page.inner_text('body')
+        if not re.search(r'no auctions|no sales|auction calendar', text, re.IGNORECASE):
+            raise RuntimeError('Broward auction page was not recognized; no records imported')
+
+
 def scrape_auction(url, county_key, page=None, browser=None):
     """Scrape a single auction date. Reuses existing page/browser if provided."""
 
@@ -385,8 +401,9 @@ def scrape_auction(url, county_key, page=None, browser=None):
             user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         )
         page = context.new_page()
-        page.goto(url, wait_until='domcontentloaded', timeout=45000)
+        response = page.goto(url, wait_until='domcontentloaded', timeout=45000)
         time.sleep(6)
+        validate_broward_page(page, response, county_key)
 
         date_match = re.search(r'AUCTIONDATE=(\d{2}/\d{2}/\d{4})', url, re.IGNORECASE)
         if not date_match:
@@ -448,7 +465,7 @@ def scrape_auction_multi(county_key, days_ahead=120):
     if county_key not in COUNTY_BASE_URLS:
         raise ValueError(f"Invalid county: {county_key}")
 
-    today = datetime.today()
+    today = datetime.today().replace(hour=0, minute=0, second=0, microsecond=0)
     cutoff_date = today + timedelta(days=days_ahead)
     base_url = COUNTY_BASE_URLS[county_key]
     start_date = get_initial_scrape_date(county_key)
@@ -499,8 +516,9 @@ def scrape_auction_multi(county_key, days_ahead=120):
                     user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
                 )
                 page = context.new_page()
-                page.goto(current_url, wait_until='domcontentloaded', timeout=45000)
+                response = page.goto(current_url, wait_until='domcontentloaded', timeout=45000)
                 time.sleep(6)
+                validate_broward_page(page, response, county_key)
 
                 try:
                     page.wait_for_selector('#Area_W', timeout=5000)
@@ -584,6 +602,9 @@ def scrape_auction_multi(county_key, days_ahead=120):
 def parse_auction_entry(text, auction_date, county_key):
     """Parse a single auction entry - handles multiple case number formats"""
 
+    if county_key == 'broward':
+        return parse_broward_entry(text, auction_date)
+
     case_match = re.search(r'Case\s*#\s*:\s*(\d{2,4}-[A-Z0-9]+)', text, re.IGNORECASE)
 
     if not case_match:
@@ -637,6 +658,27 @@ def parse_auction_entry(text, auction_date, county_key):
         'state': 'FL',
         'zip': zip_code,
         'county': county_key
+    }
+
+
+def parse_broward_entry(text, auction_date):
+    """Use the shared RealTaxDeed fields, preserving Broward's full case ID."""
+    case_match = re.search(r'Case\s*#\s*:\s*([A-Z0-9]+(?:-[A-Z0-9]+)*)', text, re.I)
+    address_match = re.search(
+        r'Property Address:[ \t]*\n?[ \t]*([^\n]+)\n[ \t]*([^\n,]+),?[ \t]+FL[- \t]*(\d{5})(?:-\d{4})?',
+        text, re.I,
+    )
+    if not case_match or not address_match:
+        # Do not silently omit lots on an unfamiliar source layout.
+        raise ValueError('Broward listing missing a case number or complete property address; review source layout')
+    return {
+        'auction_date': auction_date,
+        'case_number': case_match.group(1).upper(),
+        'address': address_match.group(1).strip(),
+        'city': address_match.group(2).strip(),
+        'state': 'FL',
+        'zip': address_match.group(3),
+        'county': 'broward',
     }
 
 
@@ -816,7 +858,7 @@ def initialize_import_tables(conn):
               last_exported_at TIMESTAMP DEFAULT NULL,
               export_count INTEGER DEFAULT 0,
               notes TEXT DEFAULT '',
-              CONSTRAINT seen_properties_county_check CHECK (county IN ('palm_beach', 'miami_dade', 'duval', 'hillsborough')),
+              CONSTRAINT seen_properties_county_check CHECK (county IN ('palm_beach', 'miami_dade', 'duval', 'hillsborough', 'broward')),
               CONSTRAINT seen_properties_unique UNIQUE (county, case_number)
             )
         ''')
