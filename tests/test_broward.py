@@ -37,6 +37,14 @@ class BrowardTests(unittest.TestCase):
         page.inner_text.return_value = 'Auction Calendar'
         app.validate_broward_page(page, Mock(status=200), 'broward')
 
+    def test_live_broward_no_sale_preview_is_accepted(self):
+        # Text observed on the September 10, 2026 preview page; Current and
+        # Next Auction link to October 26 rather than providing Area_W today.
+        page = Mock()
+        page.query_selector.return_value = None
+        page.inner_text.return_value = 'Preview Items For Sale\nThursday September 10, 2026\nNext Auction > >\nCurrent'
+        app.validate_broward_page(page, Mock(status=200), 'broward')
+
     def test_broward_no_inherited_weekday_filter(self):
         for day in range(14, 21):
             self.assertTrue(app.is_supported_auction_date('broward', datetime(2026, 9, day)))

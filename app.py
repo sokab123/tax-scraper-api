@@ -380,7 +380,7 @@ def validate_broward_page(page, response, county_key):
         raise RuntimeError(f'Broward auction website unavailable (HTTP {status}); no records imported')
     if not page.query_selector('#Area_W'):
         text = page.inner_text('body')
-        if not re.search(r'no auctions|no sales|auction calendar', text, re.IGNORECASE):
+        if not re.search(r'no auctions|no sales|auction calendar|preview items for sale', text, re.IGNORECASE):
             raise RuntimeError('Broward auction page was not recognized; no records imported')
 
 
