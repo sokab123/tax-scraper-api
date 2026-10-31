@@ -54,9 +54,26 @@ success or partial import. Apply the CRM's `20260910_add_broward.sql` migration
 before importing into an existing database.
 
 Run contract tests with `python3 -m unittest discover -s tests -v`.
-Ten contract/regression tests pass, including the observed Broward no-sale-page
+Fifteen contract/regression tests pass, including the observed Broward no-sale-page
 layout. Live verification on September 10, 2026 collected 27 unique properties
 across three pages for October 26, 2026, using the existing configured browser
 user agent. Sample source fields matched Chromium; both single-date scraping
 and local/hosted upcoming-auction navigation were verified. The CRM imported all 27
 through its existing duplicate/history checks.
+
+## Palm Beach transient-source recovery (October 31, 2026)
+
+The daily job's first Palm Beach clerk home request returned HTTP 500 while
+the other four counties completed. The clerk site later recovered. `http_get`
+and the clerk's read-only search-form `http_post` now retry transient HTTP
+429/500/502/503/504 and network/timeouts up to three attempts with 1s/2s
+backoff and the existing 60s per-request timeout. Non-transient HTTP errors
+still fail immediately; non-clerk requests are never automatically retried.
+An exhausted retry remains an error, never an empty successful scrape.
+
+The authorized recovery called only `scrape_auction_multi('palm_beach', 120)`
+and the existing deduplicating `import_scraped_properties` in the running
+service. It did not rescrape the four successful counties. Full-failure
+evidence and recovery output are retained under Stewart Files / Tax CRM Audit /
+Automation Repair 2026-10-31. Do not repeat an uncertain recovery blindly:
+check the completed output and a live read-only database audit first.

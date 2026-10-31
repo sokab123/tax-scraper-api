@@ -9,6 +9,7 @@ import threading
 from datetime import datetime, timedelta
 from urllib.parse import urlencode, urljoin, urlparse
 from urllib.request import HTTPCookieProcessor, Request, build_opener, urlopen
+from urllib.error import HTTPError, URLError
 
 app = Flask(__name__)
 
@@ -183,10 +184,30 @@ def make_http_opener():
     return build_opener(HTTPCookieProcessor(cookie_jar))
 
 
+def read_source_request(opener, request_obj):
+    """Retry only safe Palm Beach clerk reads/search forms on transient failure.
+
+    These POSTs set a search filter; they do not submit a bid, import data, or
+    mutate the CRM. Never extend retries to arbitrary application POSTs.
+    """
+    is_clerk = urlparse(request_obj.full_url).netloc.lower() == 'taxdeed.mypalmbeachclerk.com'
+    attempts = 3 if is_clerk else 1
+    for attempt in range(attempts):
+        try:
+            with opener.open(request_obj, timeout=60) as response:
+                return response.read().decode('utf-8', errors='replace')
+        except HTTPError as exc:
+            if exc.code not in (429, 500, 502, 503, 504) or attempt == attempts - 1:
+                raise
+        except (URLError, TimeoutError):
+            if attempt == attempts - 1:
+                raise
+        time.sleep(2 ** attempt)
+
+
 def http_get(opener, url):
     request_obj = Request(url, headers={'User-Agent': DEFAULT_USER_AGENT})
-    with opener.open(request_obj, timeout=60) as response:
-        return response.read().decode('utf-8', errors='replace')
+    return read_source_request(opener, request_obj)
 
 
 def http_post(opener, url, data):
@@ -198,8 +219,7 @@ def http_post(opener, url, data):
             'Content-Type': 'application/x-www-form-urlencoded'
         }
     )
-    with opener.open(request_obj, timeout=60) as response:
-        return response.read().decode('utf-8', errors='replace')
+    return read_source_request(opener, request_obj)
 
 
 def parse_palm_beach_clerk_date(value):
