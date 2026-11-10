@@ -77,3 +77,30 @@ service. It did not rescrape the four successful counties. Full-failure
 evidence and recovery output are retained under Stewart Files / Tax CRM Audit /
 Automation Repair 2026-10-31. Do not repeat an uncertain recovery blindly:
 check the completed output and a live read-only database audit first.
+
+## Palm Beach property ZIP integrity (November 10, 2026)
+
+The property appraiser's `AddressLine1`/`AddressLine3` are **owner mailing**
+fields, not situs fields. Never assign that ZIP to a property just because it
+is a Florida address or the owner's mailing city matches the municipality.
+`propertyDetail.ZipCode` is often null. Resolve ZIPs through the official
+county Situs Address layer (`OpenData/open_data_v2/FeatureServer/0`), querying
+an exact 17-digit `PCN` and reading `ZIP_CODE`. Multiple unit records are safe
+only when all returned ZIPs agree; missing, ambiguous, truncated or failed
+lookups must not fall back to the owner's ZIP. A missing situs street address
+must not fall back to the owner's mailing street either.
+
+The importer can repair a nonblank Palm Beach ZIP only when incoming metadata
+identifies this verified source and the stored, scraped, and appraiser situs
+addresses match. Other counties retain the missing-only update rule. Imports
+preserve notes, stages, export/deletion history and case identifiers. Tests
+cover the reported `3207TD` example (1256 W 30TH ST 1: situs 33404, owner 33407),
+ambiguous units, lookup failures, wrong parcels and idempotent nonblank updates.
+
+For audits, map a saved case to its official clerk PCN using its sale date;
+rescheduled cases may use a unique PCN across clerk sale dates, but require
+an unchanged appraiser situs street before correcting the ZIP. Back up all
+records, then apply guarded ZIP-only updates by database id and original ZIP,
+address and timestamp. Verify all other fields and counties remain unchanged.
+Do not restore deleted/exported leads. Evidence for this repair is under
+Stewart Files / Tax CRM Audit / ZIP Repair 2026-11-10.

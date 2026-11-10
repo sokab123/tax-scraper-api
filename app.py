@@ -37,6 +37,7 @@ DUVAL_TAX_DEED_WEEKDAY = 2  # Wednesday
 PALM_BEACH_CLERK_HOME_URL = 'https://taxdeed.mypalmbeachclerk.com/Home/'
 PALM_BEACH_CLERK_GRID_URL = 'https://taxdeed.mypalmbeachclerk.com/Home/GridSearchData?SearchType=Sale%20Date'
 PALM_BEACH_ACTIVE_STATUSES = {'SALE', 'PENDING SALE'}
+PALM_BEACH_SITUS_QUERY_URL = 'https://maps.pbc.gov/arcgis/rest/services/OpenData/open_data_v2/FeatureServer/0/query'
 DEFAULT_USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
 REQUIRED_PROPERTIES_COLUMNS = {
     'case_number',
@@ -245,13 +246,51 @@ def collect_palm_beach_clerk_sale_dates(opener, days_ahead):
 
 
 def same_address(left, right):
-    normalize = lambda value: re.sub(r'[^A-Z0-9]', '', value or '').upper()
+    normalize = lambda value: re.sub(r'[^A-Z0-9]', '', (value or '').upper())
     return bool(left and right and normalize(left) == normalize(right))
+
+
+def get_palm_beach_situs_zip(opener, parcel_id):
+    """Resolve a property's ZIP by exact PCN, never its owner's mailing ZIP."""
+    compact_pcn = re.sub(r'\D', '', parcel_id or '')
+    if len(compact_pcn) != 17:
+        return ''
+    query = urlencode({
+        'where': f"PCN='{compact_pcn}'", 'outFields': 'PCN,ZIP_CODE',
+        'returnGeometry': 'false', 'f': 'json'
+    })
+    data = json.loads(http_get(opener, f'{PALM_BEACH_SITUS_QUERY_URL}?{query}'))
+    if data.get('error') or data.get('exceededTransferLimit'):
+        raise ValueError('Palm Beach situs ZIP lookup incomplete or unavailable')
+    attributes = [feature.get('attributes') or {} for feature in data.get('features', [])]
+    if any(str(row.get('PCN') or '') != compact_pcn for row in attributes):
+        raise ValueError('Palm Beach situs ZIP lookup returned a different parcel')
+    # Multiple units are safe only when every returned situs has the same ZIP.
+    zips = {str(row.get('ZIP_CODE') or '').strip() for row in attributes}
+    if len(zips) == 1:
+        zip_code = next(iter(zips))
+        if re.fullmatch(r'\d{5}', zip_code) and zip_code != '00000':
+            return zip_code
+    return ''
+
+
+def palm_beach_verified_zip_change(county_key, existing_address, existing_zip, property_data):
+    """Permit nonblank corrections only from parcel-verified, unchanged situs."""
+    source = property_data.get('property_appraiser') or {}
+    incoming = property_data.get('zip') or ''
+    return bool(
+        county_key == 'palm_beach'
+        and source.get('zip_source') == PALM_BEACH_SITUS_QUERY_URL
+        and re.fullmatch(r'\d{5}', incoming) and incoming != '00000'
+        and incoming == source.get('zip') and incoming != existing_zip
+        and same_address(existing_address, source.get('address'))
+        and same_address(existing_address, property_data.get('address'))
+    )
 
 
 def get_palm_beach_property_appraiser_data(opener, parcel_id):
     compact_pcn = re.sub(r'\D', '', parcel_id or '')
-    if not compact_pcn:
+    if len(compact_pcn) != 17:
         return {}
 
     url = f'https://pbcpao.gov/Property/Details?parcelId={compact_pcn}'
@@ -271,6 +310,8 @@ def get_palm_beach_property_appraiser_data(opener, parcel_id):
         return {'property_appraiser_url': url}
 
     detail = model.get('propertyDetail') or {}
+    if re.sub(r'\D', '', str(detail.get('PCN') or '')) != compact_pcn:
+        return {'property_appraiser_url': url}
     location = (detail.get('Location') or '').strip()
     mailing_line1 = (detail.get('AddressLine1') or '').strip()
     mailing_line3 = (detail.get('AddressLine3') or '').strip()
@@ -279,26 +320,25 @@ def get_palm_beach_property_appraiser_data(opener, parcel_id):
     municipality = (detail.get('Municipality') or '').strip()
     city = municipality if municipality.upper() not in ('', 'UNINCORPORATED') else ''
 
-    # Zip: extract from AddressLine3 whenever it's a FL address.
-    # We don't require situs == mailing because most tax-foreclosure owners
-    # don't live at the property, so same_address() would almost always fail.
+    # AddressLine1/3 describe the OWNER, not the property. Use the county's
+    # parcel-keyed situs layer; missing/ambiguous ZIPs stay unknown.
     zip_code = ''
-    mailing_line3_match = re.search(r'\bFL\s+(\d{5})', mailing_line3, re.IGNORECASE)
-    if mailing_line3_match:
-        zip_code = mailing_line3_match.group(1).strip()
+    try:
+        zip_code = get_palm_beach_situs_zip(opener, compact_pcn)
+    except Exception as exc:
+        print(f'Could not resolve Palm Beach situs ZIP for {parcel_id}: {type(exc).__name__}', flush=True)
 
     # If we still have nothing for city, try the old mailing-line3 parse as a fallback
     if not city:
         mailing_city_match = re.search(r'(.+?)\s+FL\s+(\d{5})', mailing_line3, re.IGNORECASE)
         if mailing_city_match and same_address(location, mailing_line1):
             city = mailing_city_match.group(1).strip()
-            if not zip_code:
-                zip_code = mailing_city_match.group(2).strip()
 
     return {
-        'address': location or mailing_line1,
+        'address': location,
         'city': city,
         'zip': zip_code,
+        'zip_source': PALM_BEACH_SITUS_QUERY_URL if zip_code else '',
         'owner_name': (detail.get('OwnerName') or '').strip(),
         'municipality': (detail.get('Municipality') or '').strip(),
         'property_appraiser_url': url,
@@ -1004,7 +1044,7 @@ def import_scraped_properties(county_key, properties, dates_scraped=None):
                         continue
 
                     cur.execute('''
-                        SELECT id, city, zip FROM properties
+                        SELECT id, city, zip, address FROM properties
                         WHERE county = %s
                           AND deleted_at IS NULL
                           AND (
@@ -1014,7 +1054,7 @@ def import_scraped_properties(county_key, properties, dates_scraped=None):
                     ''', (county_key, case_number, case_number))
                     existing_property = cur.fetchone()
                     if existing_property:
-                        existing_id, existing_city, existing_zip = existing_property
+                        existing_id, existing_city, existing_zip, existing_address = existing_property
                         incoming_city = property_data.get('city')
                         incoming_zip = property_data.get('zip')
                         update_fields = []
@@ -1024,7 +1064,10 @@ def import_scraped_properties(county_key, properties, dates_scraped=None):
                             update_fields.append('city = %s')
                             update_values.append(incoming_city)
 
-                        if incoming_zip and incoming_zip != '00000' and (not existing_zip or existing_zip == '00000'):
+                        if incoming_zip and incoming_zip != '00000' and (
+                            not existing_zip or existing_zip == '00000'
+                            or palm_beach_verified_zip_change(county_key, existing_address, existing_zip, property_data)
+                        ):
                             update_fields.append('zip = %s')
                             update_values.append(incoming_zip)
 
